@@ -1,0 +1,339 @@
+---
+title: "Safe Driver Missing Data"
+author: "Anastasia Vishnyakova"
+date: "`r format(Sys.time(), %d %B %Y)`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+Import data
+
+```{r setup, include=FALSE, cache = TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(scipen=999)
+
+
+# install.packages(c('tidyverse', 'missForest', 'purrr', 'forcats', 'Matrix', 'doParallel', 'Hmisc', 'xgboost', 'caret'))
+
+
+library(tidyverse)
+library(missForest)
+library(purrr)
+library(knitr)
+library(forcats)
+library(Matrix)
+library(doParallel)
+library(Hmisc)
+library(xgboost)
+library(caret)
+
+
+# train <- read_csv("train.csv", na = c('-1', '-1.0')) %>%
+#   mutate_at(vars(matches("bin|cat|target")), funs(factor))
+#   
+# test <- read_csv('test.csv', na = c('-1', '-1.0')) %>%
+#     mutate(target = NA)%>%
+#   mutate_at(vars(matches("bin|cat|target")), funs(factor))
+
+
+
+library(dummies)
+library(forcats)
+library(Matrix)
+library(doParallel)
+
+
+library(caret)
+
+library(Amelia)
+library(VIM)
+library(mice)
+library(ggthemes)
+library(broom)
+
+library(plotly)
+library(vcd)
+library(ggmosaic)
+
+
+
+train <- read_csv("train.csv", na = c('-1', '-1.0')) %>%
+  mutate_at(vars(matches("bin|cat|target")), funs(factor))
+  
+test <- read_csv('test.csv', na = c('-1', '-1.0')) %>%
+    mutate(target = NA)%>%
+  mutate_at(vars(matches("bin|cat|target")), funs(factor))
+
+
+```
+
+Add levels for missing data categorical variables. 
+
+```{r}
+
+# train <- train %>%
+#   mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+#   mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+#          ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+# 
+# 
+# test <- test %>%
+#   mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+#   mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+#          ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+# 
+# 
+# save(train, file = 'train.Rda')
+# save(test, file = 'test.Rda')
+
+
+#load Rda files after transformations are complete
+load('train.Rda')
+load('test.Rda')
+
+```
+
+
+Impute missing values with random forest
+
+```{r}
+
+train <- train %>%
+  mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+  mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+         ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+
+
+test <- test %>%
+  mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+  mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+         ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+```
+
+
+Impute missing values with random forest, excluding the ps_car_11_cat (needs grouping)
+
+```{r}
+
+#create dummy variables from a category with too many values
+registerDoParallel(cores = detectCores()-1)
+
+registerDoParallel(cores = 4)
+
+
+train_mf <- missForest(as.data.frame(train %>% 
+                           select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat) %>%
+                           bind_cols(as.data.frame((model.matrix(target ~ ps_car_11_cat, data = train))) %>%
+                                       select( - `(Intercept)`))
+                           ) %>% sample_n(1000)
+                       ,
+                       verbose = TRUE, 
+                       ntree = 500,
+                       parallelize = 'forests'
+                       )
+
+vars_missing <- train %>% 
+  select(which(colMeans(is.na(.))>0)) %>% 
+  colnames()
+
+train_mf <- train %>%
+  select(- one_of(vars_missing)) %>%
+  bind_cols(
+    train_mf$ximp %>%
+  select(vars_missing) 
+  )
+
+save(train_mf, "train_mf.Rda")
+
+#process test data 
+test_mf <- missForest(as.data.frame(test %>% 
+                           select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat) %>%
+                           bind_cols(as.data.frame((model.matrix(target ~ ps_car_11_cat, data = test))) %>%
+                                       select( - `(Intercept)`))
+                           ) # %>% sample_n(1000)
+                       ,
+                       verbose = TRUE, 
+                       ntree = 500,
+                       parallelize = 'forests'
+                       )
+
+test_mf <- test %>%
+  select(- one_of(vars_missing)) %>%
+  bind_cols(
+    test_mf$ximp %>%
+  select(vars_missing) 
+  )
+
+save(test_mf, "test_mf.Rda")
+
+
+
+```
+
+Impute missing values with medians and most popular category
+
+```{r}
+
+
+catvars <- train %>% 
+  select(which(colMeans(is.na(.))>0))%>%
+  select(matches("bin|cat")) %>% 
+  colnames()
+
+
+nvars <- train %>% 
+  select(which(colMeans(is.na(.))>0))%>%
+  select(-one_of(catvars)) %>%
+  colnames()
+
+
+train_simp <- train %>%
+  mutate_at(vars(nvars), funs(impute(., mean)))%>%
+  mutate_at(vars(catvars), funs(impute(., 'random'))) %>%
+  select(which(colMeans(is.na(.))>0))
+save(train_simp, file = 'train_simp.Rda')
+  
+
+test_simp <- test %>%
+  mutate_at(vars(nvars), funs(impute(., mean)))%>%
+  mutate_at(vars(catvars), funs(impute(., 'random'))) %>%
+  select(which(colMeans(is.na(.))>0))
+save(test_simp, file = 'test_simp.Rda')
+
+```
+
+
+
+
+Impute missing values with hmisc
+```{r}
+
+
+#create dummy variables from a category with too many values, exclude near zero vars
+
+#train data 
+areg_formula <- as.formula(paste0(paste(" ~ "), 
+                           train %>% 
+                             select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat, - ps_calc_04, - one_of(nzv$var)) %>%
+                             colnames() %>%
+                             paste(collapse = " + ")))
+
+
+train_areg <- aregImpute(formula = areg_formula, 
+                         nk = 0,
+                         data = train %>% 
+                           select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat, - ps_calc_04, - one_of(nzv$var)) #%>% sample_n(100000)
+                         )
+
+
+train_areg <- train %>%
+  select(-one_of(vars_missing))%>%
+  bind_cols(
+    as.data.frame(impute.transcan(train_areg, 
+                                  imputation=1, 
+                                  data= train %>% 
+                                    select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat, - ps_calc_04, - one_of(nzv$var)) %>%
+                                    select(vars_missing), 
+                                  list.out=TRUE, 
+                                  pr=FALSE, 
+                                  heck=FALSE))
+  )
+
+save(train_areg, file = 'train_areg.Rda')
+
+
+
+#test data
+test_areg <- aregImpute(formula = areg_formula, 
+                         nk = 0,
+                         data = test %>% 
+                           select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat, - ps_calc_04, - one_of(nzv$var)) #%>% sample_n(100000)
+                         )
+
+
+test_areg <- test_mf %>%
+  select(-one_of(vars_missing))%>%
+  bind_cols(
+    as.data.frame(impute.transcan(test_areg, 
+                                  imputation=1, 
+                                  data= test %>% 
+                                    select(-id, - target, -ps_car_14_cat_m, - ps_reg_03_cat_m, - ps_car_11_cat, - ps_calc_04, - one_of(nzv$var)) %>%
+                                    select(vars_missing), 
+                                  list.out=TRUE, 
+                                  pr=FALSE, 
+                                  heck=FALSE))
+  )
+
+save(test_areg, file = 'train_areg.Rda')
+
+
+
+```
+
+Fit an xgboost model with one missing data imputed by random forest. Use parameters from a model trained by the team.
+
+```{r}
+train <- train %>% 
+  filter(complete.cases(.)) 
+  
+dtrain <- xgb.DMatrix(data  = model.matrix( ~ .+0, 
+                                 data = train %>% 
+                                select( -target, - id, - ps_reg_03_cat_m, - ps_car_14_cat_m), 
+                                with = FALSE),
+                      label = as.numeric(train$target)-1)
+
+
+test <- test %>% 
+  filter(complete.cases(.)) 
+  
+
+dest <- xgb.DMatrix(data  = model.matrix( ~ .+0, 
+                                 data = test %>% 
+                                select( -target, - id, - ps_reg_03_cat_m, - ps_car_14_cat_m), 
+                                with = FALSE))
+
+xgb_rm <- xgboost(data = dtrain, 
+               # label = as.numeric( train$target)-1, 
+               max_depth = 2, #15, 
+               eta = 1, # 0.01, 
+               nthread = 2, 
+               nrounds = 2, #25, 
+               subsample = 1, #0.5,
+               colsample_bytree = 0.5,
+               eval_metric = "error",
+               objective = "binary:logistic")
+
+
+ypred_mf <- predict(xgb_mf, dtest)
+
+save(ypred_mf, file = 'ypred_mf.R')
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+=======
+                           ), 
+                       verbose = TRUE, 
+                       ntree = 500,
+                       parallelize = "forests"
+                       )
+
+
+
+?missForest
+
+```
+
+>>>>>>> ead55fe520e9c3c00ae04b41a15006ebd74a44e7

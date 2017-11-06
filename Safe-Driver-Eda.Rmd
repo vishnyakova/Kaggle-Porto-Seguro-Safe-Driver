@@ -1,0 +1,321 @@
+---
+title: "Safe Driver EDA"
+author: "Anastasia Vishnyakova"
+date: "`r format(Sys.time(), %d %B %Y)`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+
+
+```{r setup, include=FALSE, cache = TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(scipen=999)
+
+library(tidyverse)
+library(Amelia)
+library(VIM)
+library(mice)
+library(ggthemes)
+library(broom)
+library(purrr)
+library(knitr)
+library(plotly)
+library(vcd)
+library(ggmosaic)
+library(forcats)
+library(caret)
+library(GGally)
+
+
+train <- read_csv("train.csv", na = c('-1', '-1.0')) %>%
+  mutate_at(vars(matches("bin|cat|target")), funs(factor))
+  
+test <- read_csv('test.csv', na = c('-1', '-1.0')) %>%
+    mutate(target = NA)%>%
+  mutate_at(vars(matches("bin|cat|target")), funs(factor))
+
+  
+```
+#EDA for Safe Driver Data
+
+This document presents EDA for Safe Driver data. 
+
+##Exploration
+
+###Train Data
+
+```{r}
+
+summary(train)
+
+```
+
+###Test Data
+
+```{r}
+
+summary(test)
+
+```
+
+###Missing Data
+
+Missing Data Pattern: % of observations missing only 1, 2, 3, etc. values 
+```{r}
+
+as.matrix(table(rowSums(is.na(train)))/dim(train)[1])
+
+```
+
+
+VIM visualization for train data
+
+```{r}
+
+train %>%
+  select(which(colMeans(is.na(.))>0)) %>%
+  aggr()
+
+
+
+  
+```
+
+VIM visualization for test data
+
+```{r}
+test %>%
+  select(which(colMeans(is.na(.))>0), - target) %>%
+  aggr()
+  
+```
+
+Missing Data table. ps_car_03, ps_car_05, ps_reg_03 are missing a high proportion of values. Action could be to create a missing value category in the first two and impute the third variable. 
+
+```{r, assis = TRUE}
+kable(
+test %>%
+  mutate(source = 'test')%>%
+  bind_rows(train %>% 
+              mutate(source = 'train'))%>%
+  select(which(colMeans(is.na(.)) > 0), source, - target) %>% 
+  group_by(source)%>%
+  summarise_all(funs(mean(is.na(.))*100)) %>%
+  gather(variable, pctmissing, - source) %>%
+  spread(source, pctmissing) %>%
+  arrange(desc(train)),
+caption = "Percent of Missing Values by Variable")
+  
+```
+
+
+
+Encode missing values in categorical variables that have a high share of missing data. Create indicator categorical variables for numerical data with missing values.
+
+```{r}
+train <- train %>%
+  mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+  mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+         ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+
+
+test <- test %>%
+  mutate_at(vars(ps_car_03_cat, ps_car_05_cat, ps_car_07_cat), funs(fct_explicit_na(., na_level = "missing"))) %>%
+  mutate(ps_reg_03_cat_m = factor(ifelse(is.na(ps_reg_03), 1, 0)),
+         ps_car_14_cat_m = factor(ifelse(is.na(ps_car_14), 1, 0)))
+```
+
+
+###Association Plots with Target vs. Categorical
+
+```{r}
+
+CreateAssociationPlots <- function(vars){
+  data <- train %>%
+    select_("response" = "target", 
+             "predictor" = vars)
+  assoc(table(data$predictor, data$response), shade = TRUE, main = vars)
+}
+
+vars <- train %>%
+  select(matches('bin|cat'), -id, - target)%>%
+  colnames() %>% 
+  as.list() 
+
+map(vars, CreateAssociationPlots)
+
+
+```
+
+
+
+###Logistic Models for Each Covariate
+
+```{r, asis = TRUE}
+
+def_nested_df <- function(x) {
+    data_frame("covariate" = x,
+               "data" = list(train %>% 
+                               tbl_df %>%
+                               select_("response" = "target", 
+                                       "predictor" = x)))
+  } 
+
+kable(
+train %>%
+  select (one_of(unlist(vars)))  %>%
+  colnames() %>%
+  map_df(def_nested_df) %>%
+  mutate(models = map(data, ~ glm(response ~ predictor, data = ., family = 'binomial')))%>%
+  unnest(map(models, tidy))
+)
+
+
+ 
+```
+
+###Logistic Models for Each Numerical Covariate
+
+```{r}
+
+kable(
+train %>%
+  select (-one_of(unlist(vars)), -id, - target)  %>%
+  colnames() %>%
+  map_df(def_nested_df) %>%
+  mutate(models = map(data, ~ glm(response ~ predictor, data = ., family = 'binomial')))%>%
+  unnest(map(models, tidy)) %>%
+  filter(term == 'predictor' & p.value < 0.05) %>%
+  arrange(desc(abs(estimate))),
+caption = 'Selected Logistic Regression Output for Numerical Variables'
+)
+
+
+```
+
+Visualize Distribution of Numeric Variables Across Target 
+
+```{r}
+#boxplots
+
+CreateBoxplots <- function(vars){
+  data <- train %>%
+    select_("response" = "target", 
+             "predictor" = vars)
+    ggplot(data, aes(x = response, y = predictor)) +
+    geom_boxplot()+
+    theme_tufte() +
+    ggtitle(vars)
+}
+
+nvars <- train %>%
+  select(-one_of(unlist(vars)), -id, - target)%>%
+  colnames() %>% 
+  as.list() 
+
+map(nvars, CreateBoxplots)
+
+
+```
+
+Density for numerical Variables across Target Variable 
+
+```{r}
+CreateDensityplots <- function(vars){
+  data <- train %>%
+    select_("response" = "target", 
+             "predictor" = vars)
+  print(vars)
+    ggplot(data, aes(predictor, color = response)) +
+    geom_line(stat = 'density', adjust = 1)+
+    theme_tufte() +
+    ggtitle(vars)
+}
+
+
+nvars <- map_df(train, class)%>%
+  gather(measure, class)%>%
+  filter(class == 'numeric') %>%
+  select(measure) %>%
+  .$measure %>%
+  as.list(nvars)
+
+map(nvars, CreateDensityplots)
+
+
+```
+
+
+
+
+Near Zero Variance Predictors using Caret
+
+```{r}
+kable(
+  (nzv <- train %>%
+  select(-id, - target)%>%
+  nearZeroVar(saveMetrics = TRUE)%>%
+  mutate(var = row.names(.))%>%
+  filter(nzv))
+  ,
+  caption = 'Near Zero Variance Predictors')
+
+save(nzv, file = 'nzv.Rda')
+
+```
+
+
+
+Correlations between Predictors
+
+```{r}
+
+(desc_cor <- train%>%
+              select(unlist(nvars), -id, -one_of(nzv$var)) %>%
+              cor(use = "pairwise.complete.obs")
+)
+
+
+train %>%
+  select(unlist(nvars), -id, -one_of(nzv$var))%>%
+  ggcorr(geom = "blank", label = TRUE, hjust = 0.75) +
+  geom_point(size = 10, aes(color = coefficient > 0, alpha = abs(coefficient) > 0.5)) +
+  scale_alpha_manual(values = c("TRUE" = 0.25, "FALSE" = 0)) +
+  guides(color = FALSE, alpha = FALSE)
+
+```
+
+Find Linear Dependencies
+
+```{r}
+
+train %>%
+  select(unlist(nvars), -id, -one_of(nzv$var), - ps_reg_03)%>%
+  filter(complete.cases(.)) %>%
+  findLinearCombos()
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
